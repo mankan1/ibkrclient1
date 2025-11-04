@@ -18,6 +18,8 @@ type SweepBlockBase = {
   notional?: number;
   prints?: number;
   ts: number;
+  // ------ NEW: optional aggressor tag (e.g., "AT_ASK", "AT_BID", "NEAR_MID")
+  aggressor?: "AT_ASK" | "AT_BID" | "NEAR_MID" | "UNKNOWN" | string;
 };
 
 type Headline = {
@@ -190,19 +192,35 @@ export default function App() {
   }
 
   /* ===== UI ===== */
-  const Row = ({ r }: { r: SweepBlockBase }) => (
-    <View style={{paddingVertical:8, borderBottomWidth:1, borderBottomColor:"#e5e7eb", flexDirection:"row", alignItems:"center"}}>
-      <View style={{width:64}}><Text style={{fontFamily: Platform.OS==="ios"?"Menlo":"monospace"}}>{r.ul}</Text></View>
-      <View style={{width:42, alignItems:"center"}}>{chip(r.right==="CALL"?"C":"P", r.right==="CALL"?"#16a34a":"#dc2626")}</View>
-      <View style={{width:70}}><Text>{r.strike}</Text></View>
-      <View style={{width:96}}><Text>{r.expiry}</Text></View>
-      <View style={{width:76}}>{chip(r.side, r.side==="BUY"?"#16a34a":r.side==="SELL"?"#dc2626":"#6b7280")}</View>
-      <View style={{flex:1, alignItems:"flex-end"}}><Text>{nf0.format(r.qty)}</Text></View>
-      <View style={{width:80, alignItems:"flex-end"}}><Text>{nf2.format(r.price)}</Text></View>
-      <View style={{width:100, alignItems:"flex-end"}}><Text style={{fontWeight: notionalOf(r)>=250000 ? "700" : "500"}}>{moneyCompact(notionalOf(r))}</Text></View>
-      <View style={{width:64, alignItems:"flex-end"}}><Text style={{opacity:0.6}}>{tsAgo(r.ts)}</Text></View>
-    </View>
-  );
+  const Row = ({ r }: { r: SweepBlockBase }) => {
+    const sideColor = r.side === "BUY" ? "#16a34a" : r.side === "SELL" ? "#dc2626" : "#6b7280";
+    const aggr = (r.aggressor || "").replace(/_/g, " ").trim();
+    return (
+      <View style={{paddingVertical:8, borderBottomWidth:1, borderBottomColor:"#e5e7eb", flexDirection:"row", alignItems:"center"}}>
+        <View style={{width:64}}><Text style={{fontFamily: Platform.OS==="ios"?"Menlo":"monospace"}}>{r.ul}</Text></View>
+        <View style={{width:42, alignItems:"center"}}>{chip(r.right==="CALL"?"C":"P", r.right==="CALL"?"#16a34a":"#dc2626")}</View>
+        <View style={{width:70}}><Text>{r.strike}</Text></View>
+        <View style={{width:96}}><Text>{r.expiry}</Text></View>
+
+        {/* ===== CHANGED: Side column now shows "SIDE @ PRICE" and optional aggressor badge */}
+        <View style={{width:126}}>
+          <Text style={{fontWeight:"700", color: sideColor}}>
+            {r.side} <Text style={{color:"#111"}}>@ {nf2.format(r.price)}</Text>
+          </Text>
+          {!!aggr && (
+            <View style={{marginTop:2, alignSelf:"flex-start"}}>
+              {chip(aggr, "#6b7280")}
+            </View>
+          )}
+        </View>
+
+        <View style={{flex:1, alignItems:"flex-end"}}><Text>{nf0.format(r.qty)}</Text></View>
+        <View style={{width:80, alignItems:"flex-end"}}><Text>{nf2.format(r.price)}</Text></View>
+        <View style={{width:100, alignItems:"flex-end"}}><Text style={{fontWeight: notionalOf(r)>=250000 ? "700" : "500"}}>{moneyCompact(notionalOf(r))}</Text></View>
+        <View style={{width:64, alignItems:"flex-end"}}><Text style={{opacity:0.6}}>{tsAgo(r.ts)}</Text></View>
+      </View>
+    );
+  };
 
   return (
     <SafeAreaView style={{flex:1, backgroundColor:"#fff"}}>
@@ -354,7 +372,8 @@ const HeaderRow = () => (
     <Text style={{width:42, fontWeight:"700"}}>R</Text>
     <Text style={{width:70, fontWeight:"700"}}>Strike</Text>
     <Text style={{width:96, fontWeight:"700"}}>Expiry</Text>
-    <Text style={{width:76, fontWeight:"700"}}>Side</Text>
+    {/* ===== CHANGED: widen Side column label to reflect "@ Px" */}
+    <Text style={{width:126, fontWeight:"700"}}>Side @ Px</Text>
     <Text style={{flex:1, textAlign:"right", fontWeight:"700"}}>Qty</Text>
     <Text style={{width:80, textAlign:"right", fontWeight:"700"}}>Price</Text>
     <Text style={{width:100, textAlign:"right", fontWeight:"700"}}>Notional</Text>
@@ -378,4 +397,3 @@ function normalizeWatchlist(raw:any):Watchlist{
   const opts = Array.isArray(raw?.options) ? raw.options : [];
   return { equities: eqs, options: opts };
 }
-
