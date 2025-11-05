@@ -1,3 +1,4 @@
+// src/App.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { FlatList, Platform, SafeAreaView, StatusBar, Text, TextInput, TouchableOpacity, View } from "react-native";
 import Constants from "expo-constants";
@@ -6,7 +7,10 @@ import Constants from "expo-constants";
 const API_BASE = (Constants.expoConfig?.extra as any)?.API_BASE ?? "http://127.0.0.1:8080";
 const WS_URL   = (Constants.expoConfig?.extra as any)?.WS_URL ?? "ws://127.0.0.1:8080/ws";
 
-/* ============== Types ============== */
+/* ============== Types (extended for action badges) ============== */
+type ActionLabel = "BTO" | "BTO?" | "BTC" | "STO" | "STO?" | "STC" | "CLOSE?" | "—";
+type ActionConf  = "high" | "medium" | "low";
+
 type SweepBlockBase = {
   ul: string;
   right: "CALL" | "PUT";
@@ -18,8 +22,17 @@ type SweepBlockBase = {
   notional?: number;
   prints?: number;
   ts: number;
-  // ------ NEW: optional aggressor tag (e.g., "AT_ASK", "AT_BID", "NEAR_MID")
+
+  // existing optional
   aggressor?: "AT_ASK" | "AT_BID" | "NEAR_MID" | "UNKNOWN" | string;
+
+  // ===== NEW: server-enriched fields for badges & context =====
+  action?: ActionLabel;
+  action_conf?: ActionConf;
+  at?: "bid" | "ask" | "mid" | "between";
+  oi?: number | null;
+  priorVol?: number | null;
+  reason?: string;
 };
 
 type Headline = {
@@ -31,6 +44,11 @@ type Headline = {
   side?: "BUY"|"SELL"|"UNKNOWN";
   notional: number;
   ts: number;
+
+  // ===== NEW: show action badge on headlines if present =====
+  action?: ActionLabel;
+  action_conf?: ActionConf;
+  at?: "bid" | "ask" | "mid" | "between";
 };
 
 type Watchlist = {
@@ -43,6 +61,11 @@ type Notable = {
   text: string;             // human string
   weight?: number;          // for sorting
   ts?: number;
+
+  // ===== NEW: optional action fields if the backend includes them =====
+  action?: ActionLabel;
+  action_conf?: ActionConf;
+  at?: "bid" | "ask" | "mid" | "between";
 };
 
 /* ============== Helpers ============== */
@@ -60,6 +83,7 @@ const tsAgo = (t:number) => {
   const h = Math.floor(m/60);   if (h < 24) return `${h}h`;
   return `${Math.floor(h/24)}d`;
 };
+
 const chip = (txt:string, color:"#16a34a"|"#dc2626"|"#6b7280"="#6b7280") => (
   <View style={{
     paddingHorizontal:8,paddingVertical:2,borderRadius:6,
@@ -69,6 +93,38 @@ const chip = (txt:string, color:"#16a34a"|"#dc2626"|"#6b7280"="#6b7280") => (
     <Text style={{fontSize:12,color}}>{txt}</Text>
   </View>
 );
+
+/* ===== NEW: ActionBadge (RN) ===== */
+function ActionBadge({ action, conf, at }: { action?: ActionLabel; conf?: ActionConf; at?: "bid"|"ask"|"mid"|"between" }) {
+  const label = action ?? "—";
+  const colorMap: Record<ActionLabel, string> = {
+    BTO: "#2563eb", "BTO?": "#60a5fa",
+    BTC: "#16a34a",
+    STO: "#dc2626", "STO?": "#f87171",
+    STC: "#ea580c",
+    "CLOSE?": "#f59e0b",
+    "—": "#6b7280",
+  };
+  const bg = colorMap[label] ?? "#6b7280";
+  const ring = conf === "high" ? 3 : conf === "medium" ? 2 : 1;
+
+  return (
+    <View style={{flexDirection:"row", alignItems:"center"}}>
+      <View style={{
+        backgroundColor: bg, borderRadius:9999,
+        paddingVertical:4, paddingHorizontal:10,
+        borderWidth: ring, borderColor: "rgba(255,255,255,0.6)"
+      }}>
+        <Text style={{fontSize:12, color:"#fff", fontWeight:"800"}}>{label}</Text>
+      </View>
+      {at ? (
+        <View style={{marginLeft:6, paddingHorizontal:6, paddingVertical:2, borderRadius:6, borderWidth:1, borderColor:"#e5e7eb"}}>
+          <Text style={{fontSize:10, color:"#374151"}}>{String(at).toUpperCase()}</Text>
+        </View>
+      ) : null}
+    </View>
+  );
+}
 
 /* ============== Tabs ============== */
 type Tab = "Headlines" | "Sweeps" | "Blocks" | "Notables" | "Watchlist";
@@ -110,7 +166,6 @@ export default function App() {
           switch (msg.topic) {
             case "headlines": {
               const list: Headline[] = msg.data ?? [];
-              // De-dup on key (type/ul/right/strike/expiry/side) keep largest notional
               setHeadlines(prev => {
                 const recent = prev.filter(p => Date.now()-p.ts <= 60_000);
                 const key = (h:Headline)=>[h.type,h.ul,h.right?.toString().slice(0,1)??"",h.strike??"",h.expiry??"",h.side??""].join("|");
@@ -156,7 +211,13 @@ export default function App() {
           const rows: Notable[] = Array.isArray(data?.rows) ? data.rows :
                                   Array.isArray(data) ? data : [];
           setNotables(rows
-            .map((r:any)=> ({ tag: r.tag || r.type || "Notable", text: r.text || r.desc || JSON.stringify(r), weight: r.weight ?? r.score ?? 0, ts: r.ts ?? Date.now() }))
+            .map((r:any)=> ({
+              tag: r.tag || r.type || "Notable",
+              text: r.text || r.desc || JSON.stringify(r),
+              weight: r.weight ?? r.score ?? 0,
+              ts: r.ts ?? Date.now(),
+              action: r.action, action_conf: r.action_conf, at: r.at
+            }))
             .sort((a,b)=> (b.weight - a.weight) || ((b.ts ?? 0) - (a.ts ?? 0)))
             .slice(0, 20));
         }
@@ -191,9 +252,9 @@ export default function App() {
     await fetch(`${API_BASE}/watchlist/equities/${encodeURIComponent(sym)}`, { method:"DELETE" });
   }
 
-  /* ===== UI ===== */
+  /* ===== Row components ===== */
   const Row = ({ r }: { r: SweepBlockBase }) => {
-    const sideColor = r.side === "BUY" ? "#16a34a" : r.side === "SELL" ? "#dc2626" : "#6b7280";
+    const sideColorHex = r.side === "BUY" ? "#16a34a" : r.side === "SELL" ? "#dc2626" : "#6b7280";
     const aggr = (r.aggressor || "").replace(/_/g, " ").trim();
     return (
       <View style={{paddingVertical:8, borderBottomWidth:1, borderBottomColor:"#e5e7eb", flexDirection:"row", alignItems:"center"}}>
@@ -202,9 +263,14 @@ export default function App() {
         <View style={{width:70}}><Text>{r.strike}</Text></View>
         <View style={{width:96}}><Text>{r.expiry}</Text></View>
 
-        {/* ===== CHANGED: Side column now shows "SIDE @ PRICE" and optional aggressor badge */}
-        <View style={{width:126}}>
-          <Text style={{fontWeight:"700", color: sideColor}}>
+        {/* ===== NEW: Action badge column ===== */}
+        <View style={{width:110}}>
+          <ActionBadge action={r.action} conf={r.action_conf} at={r.at} />
+        </View>
+
+        {/* Side @ Price + legacy aggressor chip */}
+        <View style={{width:140}}>
+          <Text style={{fontWeight:"700", color: sideColorHex}}>
             {r.side} <Text style={{color:"#111"}}>@ {nf2.format(r.price)}</Text>
           </Text>
           {!!aggr && (
@@ -222,6 +288,42 @@ export default function App() {
     );
   };
 
+  const HeadlineRow = ({ h }: { h: Headline }) => {
+    const sideColorHex = h.side==="BUY" ? "#16a34a" : h.side==="SELL" ? "#dc2626" : "#6b7280";
+    const rShort = h.right ? ((h.right==="CALL" || h.right==="PUT") ? h.right[0] : h.right) : "";
+    return (
+      <View style={{padding:12, borderBottomWidth:1, borderBottomColor:"#e5e7eb"}}>
+        <View style={{flexDirection:"row", alignItems:"center", marginBottom:6}}>
+          {chip(h.type, "#6b7280")}
+          <Text style={{marginLeft:8, fontFamily: Platform.OS==="ios"?"Menlo":"monospace"}}>{h.ul}</Text>
+          {!!rShort && <Text style={{marginLeft:6}}>{rShort}{h.strike ?? ""}</Text>}
+          {!!h.expiry && <Text style={{marginLeft:8, color:"#6b7280"}}>{h.expiry}</Text>}
+          {h.side && h.side!=="UNKNOWN" && <View style={{marginLeft:8}}>{chip(h.side, sideColorHex as any)}</View>}
+
+          {/* ===== NEW: action badge in headlines when present ===== */}
+          {h.action && <View style={{marginLeft:8}}><ActionBadge action={h.action} conf={h.action_conf} at={h.at} /></View>}
+
+          <Text style={{marginLeft:"auto"}}>{moneyCompact(h.notional)}</Text>
+        </View>
+        <Text style={{color:"#6b7280"}}>{new Date(h.ts).toLocaleTimeString()} · {tsAgo(h.ts)}</Text>
+      </View>
+    );
+  };
+
+  const NotableRow = ({ n }: { n: Notable }) => (
+    <View style={{padding:12, borderBottomWidth:1, borderBottomColor:"#e5e7eb"}}>
+      <View style={{flexDirection:"row", alignItems:"center", marginBottom:6}}>
+        {chip(n.tag || "Notable", "#6b7280")}
+        {typeof n.weight==="number" && <Text style={{marginLeft:8, color:"#6b7280"}}>score {nf1.format(n.weight||0)}</Text>}
+        {/* ===== NEW: action badge if notables include it ===== */}
+        {n.action && <View style={{marginLeft:8}}><ActionBadge action={n.action} conf={n.action_conf} at={n.at} /></View>}
+        <Text style={{marginLeft:"auto", color:"#6b7280"}}>{n.ts ? tsAgo(n.ts) : ""}</Text>
+      </View>
+      <Text>{n.text}</Text>
+    </View>
+  );
+
+  /* ===== UI ===== */
   return (
     <SafeAreaView style={{flex:1, backgroundColor:"#fff"}}>
       <StatusBar barStyle="dark-content" />
@@ -277,19 +379,7 @@ export default function App() {
           data={headlines}
           keyExtractor={(h,i)=>`${h.ts}:${i}`}
           ListHeaderComponent={()=>(<View style={{padding:10}}><Text style={{fontWeight:"700"}}>Top Flow (rolling 60s)</Text></View>)}
-          renderItem={({item:h})=>(
-            <View style={{padding:12, borderBottomWidth:1, borderBottomColor:"#e5e7eb"}}>
-              <View style={{flexDirection:"row", alignItems:"center", marginBottom:6}}>
-                {chip(h.type, "#6b7280")}
-                <Text style={{marginLeft:8, fontFamily: Platform.OS==="ios"?"Menlo":"monospace"}}>{h.ul}</Text>
-                {h.right && <Text style={{marginLeft:6}}>{(h.right==="CALL" || h.right==="PUT") ? h.right[0] : h.right}{h.strike ? h.strike : ""}</Text>}
-                {h.expiry && <Text style={{marginLeft:8, color:"#6b7280"}}>{h.expiry}</Text>}
-                {h.side && h.side!=="UNKNOWN" && <View style={{marginLeft:8}}>{chip(h.side, h.side==="BUY"?"#16a34a":"#dc2626")}</View>}
-                <Text style={{marginLeft:"auto"}}>{moneyCompact(h.notional)}</Text>
-              </View>
-              <Text style={{color:"#6b7280"}}>{new Date(h.ts).toLocaleTimeString()} · {tsAgo(h.ts)}</Text>
-            </View>
-          )}
+          renderItem={({item})=> <HeadlineRow h={item} />}
         />
       )}
 
@@ -316,16 +406,7 @@ export default function App() {
           data={notables}
           keyExtractor={(n,i)=>`${n.ts}:${i}`}
           ListHeaderComponent={()=>(<View style={{padding:10}}><Text style={{fontWeight:"700"}}>Notable Flow</Text></View>)}
-          renderItem={({item:n})=>(
-            <View style={{padding:12, borderBottomWidth:1, borderBottomColor:"#e5e7eb"}}>
-              <View style={{flexDirection:"row", alignItems:"center", marginBottom:6}}>
-                {chip(n.tag || "Notable", "#6b7280")}
-                {typeof n.weight==="number" && <Text style={{marginLeft:8, color:"#6b7280"}}>score {nf1.format(n.weight||0)}</Text>}
-                <Text style={{marginLeft:"auto", color:"#6b7280"}}>{n.ts ? tsAgo(n.ts) : ""}</Text>
-              </View>
-              <Text>{n.text}</Text>
-            </View>
-          )}
+          renderItem={({item})=> <NotableRow n={item} />}
         />
       )}
 
@@ -365,15 +446,15 @@ export default function App() {
   );
 }
 
-/* ===== Header row for tables ===== */
+/* ===== Header row for tables (added Action col) ===== */
 const HeaderRow = () => (
   <View style={{paddingVertical:8, paddingHorizontal:12, borderBottomWidth:1, borderBottomColor:"#e5e7eb", backgroundColor:"#f9fafb", flexDirection:"row"}}>
     <Text style={{width:64, fontWeight:"700"}}>UL</Text>
     <Text style={{width:42, fontWeight:"700"}}>R</Text>
     <Text style={{width:70, fontWeight:"700"}}>Strike</Text>
     <Text style={{width:96, fontWeight:"700"}}>Expiry</Text>
-    {/* ===== CHANGED: widen Side column label to reflect "@ Px" */}
-    <Text style={{width:126, fontWeight:"700"}}>Side @ Px</Text>
+    <Text style={{width:110, fontWeight:"700"}}>Action</Text>
+    <Text style={{width:140, fontWeight:"700"}}>Side @ Px</Text>
     <Text style={{flex:1, textAlign:"right", fontWeight:"700"}}>Qty</Text>
     <Text style={{width:80, textAlign:"right", fontWeight:"700"}}>Price</Text>
     <Text style={{width:100, textAlign:"right", fontWeight:"700"}}>Notional</Text>
