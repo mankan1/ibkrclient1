@@ -30,7 +30,7 @@ type SweepBlockBase = {
   at?: "bid" | "ask" | "mid" | "between";
   oi?: number | null;
   priorVol?: number | null;
-  volume?: number | null; // current-day option volume
+  volume?: number | null;
   reason?: string;
 
   ul_px?: number;
@@ -56,17 +56,30 @@ type Watchlist = {
   options: { underlying: string; expiration: string; strike: number; right: "C"|"P" }[];
 };
 
-// type Notable = {
-//   tag: string;
-//   text: string;
-//   weight?: number;
-//   ts?: number;
-//   action?: ActionLabel;
-//   action_conf?: ActionConf;
-//   at?: "bid" | "ask" | "mid" | "between";
-//   ul?: string;
-//   ul_px?: number;
-// };
+type Notable = {
+  tag?: string;                    // Display chip (e.g. BLOCKS)
+  kind?: "blocks" | "sweeps" | "prints";
+  text?: string;
+  headline?: string;
+
+  ul?: string;
+  ul_px?: number;
+
+  // Summary metrics
+  weight?: number;
+  score?: number;
+  dteAvg?: number;
+  qty$?: number;
+  notional$?: number;
+  burst?: number;
+
+  side?: "BUY" | "SELL" | "UNKNOWN";
+
+  ts?: number;
+  action?: ActionLabel;
+  action_conf?: ActionConf;
+  at?: "bid" | "ask" | "mid" | "between";
+};
 
 /* ============== Helpers ============== */
 const nf0 = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
@@ -101,7 +114,7 @@ function norm(sym?: string) {
   return (sym ?? "").toString().trim().toUpperCase();
 }
 
-/* ---------- UL/print normalizers (robust) ---------- */
+/* ---------- Normalizers ---------- */
 function coerceUl(x:any): string {
   let ul =
     x.ul ?? x.underlying ?? x.ul_symbol ?? x.symbol ?? x.root ?? x.underlyingSymbol ?? "";
@@ -156,7 +169,7 @@ function standardizeHeadline(h:any): Headline {
     right: (rightRaw==="C"||rightRaw==="CALL") ? "C" : (rightRaw==="P"||rightRaw==="PUT") ? "P" : undefined,
     strike: toNum(h.strike ?? h.k),
     expiry: String(h.expiry ?? h.expiration ?? h.exp ?? "") || undefined,
-    side: (h.side ?? h.action ?? "UNKNOWN").toUpperCase(),
+    side: (h.side ?? h.action ?? "UNKNOWN").toUpperCase() as any,
     notional: Number(h.notional ?? h.notl ?? 0),
     ts: Number(h.ts ?? h.time ?? Date.now()),
     action: h.action,
@@ -166,7 +179,7 @@ function standardizeHeadline(h:any): Headline {
   };
 }
 
-/* ===== ActionBadge (RN) ===== */
+/* ===== ActionBadge ===== */
 function ActionBadge({ action, conf, at }: { action?: ActionLabel; conf?: ActionConf; at?: "bid"|"ask"|"mid"|"between" }) {
   const label = action ?? "—";
   const colorMap: Record<ActionLabel, string> = {
@@ -197,20 +210,23 @@ function ActionBadge({ action, conf, at }: { action?: ActionLabel; conf?: Action
     </View>
   );
 }
+
+/* ===== Notables helpers ===== */
 function standardizeNotable(x:any): Notable {
   const ul = coerceUl(x);
-  const weight = toNum(x.score) ?? toNum(x.weight);
-  const notl = toNum(x.notional) ?? toNum(x.notional$) ?? toNum(x.notional_usd);
-  const qty  = toNum(x.qty) ?? toNum(x.qty$) ?? toNum(x.count) ?? toNum(x.size);
+  const score = toNum(x.score);
+  const notl  = toNum(x.notional) ?? toNum(x.notional$) ?? toNum(x.notional_usd);
+  const qty   = toNum(x.qty) ?? toNum(x.qty$) ?? toNum(x.count) ?? toNum(x.size);
   const burst = toNum(x.burst);
   const dte   = toNum(x.dteAvg ?? x.dte);
+  const side  = String(x.side ?? "UNKNOWN").toUpperCase() as Notable["side"];
+  const kind  = (String(x.kind || "").toLowerCase() as Notable["kind"]) || undefined;
 
-  // Prefer server-provided headline; otherwise compose a readable line
   const text =
     x.headline ||
     [
       ul,
-      String(x.side ?? "").toUpperCase(),
+      side,
       notl != null ? moneyCompact(notl) : undefined,
       qty  != null ? `• ${nf0.format(qty)}x` : undefined,
       burst!= null ? `• burst ${nf0.format(burst)}` : undefined,
@@ -218,39 +234,25 @@ function standardizeNotable(x:any): Notable {
     ].filter(Boolean).join(" ");
 
   return {
-    tag: String(x.kind ?? x.tag ?? "Notable").toUpperCase(),
+    tag: String(x.tag ?? x.kind ?? "Notable").toUpperCase(),
+    kind,
     text,
-    weight,
+    headline: x.headline,
+    score,
+    dteAvg: dte,
+    qty$: qty,
+    notional$: notl,
+    burst,
+    side,
     ts: toNum(x.ts) ?? Date.now(),
     action: x.action,
     action_conf: x.action_conf,
-    at: (x.at ?? x.aggressor)?.toLowerCase(),
+    at: (x.at ?? x.aggressor)?.toLowerCase() as any,
     ul,
     ul_px: toNum(x.ul_px),
   };
 }
-type Notable = {
-  tag?: string;            // e.g., "BLOCKS" or "SWEEPS"
-  kind?: "blocks" | "sweeps" | "prints";
-  text?: string;
-  headline?: string;
 
-  ul?: string;
-  ul_px?: number;
-
-  // scoring/summary coming from server
-  weight?: number;
-  score?: number;
-  dteAvg?: number;
-  qty$?: number;
-  notional$?: number;
-  burst?: number;
-
-  ts?: number;
-  action?: ActionLabel;
-  action_conf?: ActionConf;
-  at?: "bid" | "ask" | "mid" | "between";
-};
 function pickContractsForNotable(
   n: Notable,
   { blocks, sweeps, prints }: { blocks: SweepBlockBase[]; sweeps: SweepBlockBase[]; prints: SweepBlockBase[] },
@@ -259,7 +261,6 @@ function pickContractsForNotable(
   const UL = norm(n.ul || "");
   if (!UL) return [];
 
-  // time window: if notable has ts, use +/- 60s; else last 2m
   const center = n.ts ?? now;
   const windowMs = 60_000;
   const since = center - windowMs;
@@ -267,14 +268,12 @@ function pickContractsForNotable(
 
   const inWin = (r: SweepBlockBase) => r.ts >= since && r.ts <= until && norm(r.ul) === UL;
 
-  // choose pool based on kind; fall back to all
   let pool: SweepBlockBase[] = [];
   if (n.kind === "blocks") pool = blocks.filter(inWin);
   else if (n.kind === "sweeps") pool = sweeps.filter(inWin);
   else if (n.kind === "prints") pool = prints.filter(inWin);
   else pool = [...blocks, ...sweeps, ...prints].filter(inWin);
 
-  // group by (right,strike,expiry,at) and take the largest by notional
   const key = (r: SweepBlockBase) => [r.right, r.strike, r.expiry, r.at ?? ""].join("|");
   const agg = new Map<string, { sample: SweepBlockBase; qty: number; notional: number }>();
   for (const r of pool) {
@@ -290,10 +289,11 @@ function pickContractsForNotable(
 
   const rows = Array.from(agg.values())
     .sort((a, b) => (b.notional - a.notional) || (b.qty - a.qty))
-    .slice(0, 3); // show top 3 legs max
+    .slice(0, 3);
 
   return rows.map(x => x.sample);
 }
+
 function daysToExpiry(exp?: string) {
   if (!exp) return undefined;
   const d = new Date(exp + (exp.length === 10 ? "T20:00:00Z" : "")); // tolerate 'YYYY-MM-DD'
@@ -304,7 +304,7 @@ function daysToExpiry(exp?: string) {
 function ContractChip({ r }: { r: SweepBlockBase }) {
   const dte = daysToExpiry(r.expiry);
   return (
-    <View style={{flexDirection:"row", alignItems:"center", marginRight:8, paddingHorizontal:8, paddingVertical:4, borderWidth:1, borderColor:"#e5e7eb", borderRadius:8}}>
+    <View style={{flexDirection:"row", alignItems:"center", marginRight:8, marginBottom:6, paddingHorizontal:8, paddingVertical:4, borderWidth:1, borderColor:"#e5e7eb", borderRadius:8}}>
       {chip(r.right === "CALL" ? "C" : "P", r.right === "CALL" ? "#16a34a" : "#dc2626")}
       <Text style={{marginLeft:6}}>{r.strike}</Text>
       {!!r.expiry && <Text style={{marginLeft:6, color:"#6b7280"}}>{r.expiry}</Text>}
@@ -313,6 +313,7 @@ function ContractChip({ r }: { r: SweepBlockBase }) {
     </View>
   );
 }
+
 /* ===== Vol/OI Ratio Chip ===== */
 function RatioChip({ vol, oi }: { vol?: number | null; oi?: number | null }) {
   const v = typeof vol === "number" && Number.isFinite(vol) ? vol : 0;
@@ -398,7 +399,6 @@ export default function App() {
             }
 
             case "prints": {
-              // ➕ NEW: actually render prints, not just seed UL price
               const arr = Array.isArray(msg.data) ? msg.data : [msg.data];
               const inc: SweepBlockBase[] = arr.map(standardizePrint);
               for (const m of inc) {
@@ -617,7 +617,6 @@ export default function App() {
           {!!rShort && <Text style={{marginLeft:6}}>{rShort}{h.strike ?? ""}</Text>}
           {!!h.expiry && <Text style={{marginLeft:8, color:"#6b7280"}}>{h.expiry}</Text>}
           {h.side && h.side!=="UNKNOWN" && <View style={{marginLeft:8}}>{chip(h.side, sideColorHex as any)}</View>}
-          {/* Ensure action badge shows for PRINT/SWEEP/BLOCK alike */}
           {h.action && <View style={{marginLeft:8}}><ActionBadge action={h.action} conf={h.action_conf} at={h.at} /></View>}
           <Text style={{marginLeft:"auto"}}>{moneyCompact(h.notional)}</Text>
         </View>
@@ -627,51 +626,39 @@ export default function App() {
   };
 
   const NotableRow = ({ n }: { n: Notable }) => {
-  const ul = n.ul ? norm(n.ul) : undefined;
-  const ulPx = ul ? (toNum(n.ul_px) ?? ulPrices[ul]) : undefined;
-  const legs = pickContractsForNotable(n, { blocks, sweeps, prints });
+    const ul = n.ul ? norm(n.ul) : undefined;
+    const ulPx = ul ? (toNum(n.ul_px) ?? ulPrices[ul]) : undefined;
+    const legs = pickContractsForNotable(n, { blocks, sweeps, prints });
 
-  return (
-    <View style={{padding:12, borderBottomWidth:1, borderBottomColor:"#e5e7eb"}}>
-      <View style={{flexDirection:"row", alignItems:"center", marginBottom:6}}>
-        {chip((n.tag || n.kind || "Notable").toString().toUpperCase(), "#6b7280")}
-        {typeof n.score === "number" && <Text style={{marginLeft:8, color:"#6b7280"}}>score {nf1.format(n.score)}</Text>}
-        {typeof n.dteAvg === "number" && <Text style={{marginLeft:8, color:"#6b7280"}}>avg {nf1.format(n.dteAvg)} DTE</Text>}
-        {!!ul && <Text style={{marginLeft:8, fontFamily: Platform.OS==="ios"?"Menlo":"monospace"}}>{ul} {ulPx!=null?`· ${nf2.format(ulPx)}`:""}</Text>}
-        <Text style={{marginLeft:"auto", color:"#6b7280"}}>{n.ts ? tsAgo(n.ts) : ""}</Text>
-      </View>
+    const sideColor = n.side === "BUY" ? "#16a34a" : n.side === "SELL" ? "#dc2626" : "#6b7280";
 
-      {/* Headline or text */}
-      {!!n.headline && <Text style={{marginBottom:6}}>{n.headline}</Text>}
-      {!n.headline && !!n.text && <Text style={{marginBottom:6}}>{n.text}</Text>}
-
-      {/* Representative legs (derived client-side) */}
-      {legs.length > 0 ? (
-        <View style={{flexDirection:"row", flexWrap:"wrap", marginTop:2}}>
-          {legs.map((r, i) => <ContractChip key={i} r={r} />)}
+    return (
+      <View style={{padding:12, borderBottomWidth:1, borderBottomColor:"#e5e7eb"}}>
+        <View style={{flexDirection:"row", alignItems:"center", marginBottom:6}}>
+          {chip((n.tag || n.kind || "Notable").toString().toUpperCase(), "#6b7280")}
+          {n.side && n.side!=="UNKNOWN" && <View style={{marginLeft:8}}>{chip(n.side, sideColor as any)}</View>}
+          {typeof n.score === "number" && <Text style={{marginLeft:8, color:"#6b7280"}}>score {nf1.format(n.score)}</Text>}
+          {typeof n.dteAvg === "number" && <Text style={{marginLeft:8, color:"#6b7280"}}>avg {nf1.format(n.dteAvg)} DTE</Text>}
+          {!!ul && <Text style={{marginLeft:8, fontFamily: Platform.OS==="ios"?"Menlo":"monospace"}}>{ul} {ulPx!=null?`· ${nf2.format(ulPx)}`:""}</Text>}
+          <Text style={{marginLeft:"auto", color:"#6b7280"}}>{n.ts ? tsAgo(n.ts) : ""}</Text>
         </View>
-      ) : (
-        <Text style={{color:"#9ca3af"}}>No matching legs found in recent window.</Text>
-      )}
-    </View>
-  );
-};
-  // const NotableRow = ({ n }: { n: Notable }) => {
-  //   const ul = n.ul ? norm(n.ul) : undefined;
-  //   const ulPx = ul ? (toNum(n.ul_px) ?? ulPrices[ul]) : undefined;
-  //   return (
-  //     <View style={{padding:12, borderBottomWidth:1, borderBottomColor:"#e5e7eb"}}>
-  //       <View style={{flexDirection:"row", alignItems:"center", marginBottom:6}}>
-  //         {chip((n.tag || "Notable").replace(/_/g," ").toUpperCase(), "#6b7280")}
-  //         {typeof n.weight==="number" && <Text style={{marginLeft:8, color:"#6b7280"}}>score {nf1.format(n.weight||0)}</Text>}
-  //         {n.action && <View style={{marginLeft:8}}><ActionBadge action={n.action} conf={n.action_conf} at={n.at} /></View>}
-  //         {!!ul && <Text style={{marginLeft:8, fontFamily: Platform.OS==="ios"?"Menlo":"monospace"}}>{ul} {ulPx!=null?`· ${nf2.format(ulPx)}`:""}</Text>}
-  //         <Text style={{marginLeft:"auto", color:"#6b7280"}}>{n.ts ? tsAgo(n.ts) : ""}</Text>
-  //       </View>
-  //       <Text>{n.text}</Text>
-  //     </View>
-  //   );
-  // };
+
+        {/* Headline or text */}
+        {!!n.headline && <Text style={{marginBottom:6}}>{n.headline}</Text>}
+        {!n.headline && !!n.text && <Text style={{marginBottom:6}}>{n.text}</Text>}
+
+        {/* Representative legs */}
+        <Text style={{marginTop:2, marginBottom:4, color:"#6b7280"}}>Rep legs</Text>
+        {legs.length > 0 ? (
+          <View style={{flexDirection:"row", flexWrap:"wrap"}}>
+            {legs.map((r, i) => <ContractChip key={i} r={r} />)}
+          </View>
+        ) : (
+          <Text style={{color:"#9ca3af"}}>No matching legs found in recent window.</Text>
+        )}
+      </View>
+    );
+  };
 
   /* ===== UI ===== */
   return (
@@ -685,9 +672,14 @@ export default function App() {
 
       {/* Tabs */}
       <View style={{flexDirection:"row", paddingHorizontal:8}}>
-        {(["Headlines","Sweeps","Blocks","Prints","Notables","Watchlist"] as Tab[]).map(t =>
-          <TabButton key={t} label={t} active={tab===t} onPress={()=>setTab(t)} />
-        )}
+        {(['Headlines','Sweeps','Blocks','Prints','Notables','Watchlist'] as const).map((t) => (
+          <TabButton
+            key={t}
+            label={t as Tab}
+            active={tab === (t as Tab)}
+            onPress={() => setTab(t as Tab)}
+          />
+        ))}
       </View>
 
       {/* Filters (for Sweeps/Blocks/Prints) */}
