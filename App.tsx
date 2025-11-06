@@ -5,7 +5,7 @@ import Constants from "expo-constants";
 
 /* ============== Config ============== */
 const API_BASE = (Constants.expoConfig?.extra as any)?.API_BASE ?? "http://127.0.0.1:8080";
-const WS_URL   = (Constants.expoConfig?.extra as any)?.WS_URL ?? "ws://127.0.0.1:8080/ws";
+const WS_URL   = (Constants.expoConfig?.extra as any)?.WS_URL   ?? "ws://127.0.0.1:8080/ws";
 
 /* ============== Types ============== */
 type ActionLabel = "BTO" | "BTO?" | "BTC" | "STO" | "STO?" | "STC" | "CLOSE?" | "—";
@@ -33,7 +33,6 @@ type SweepBlockBase = {
   volume?: number | null; // current-day option volume
   reason?: string;
 
-  // may arrive in payloads; we’ll use it if present
   ul_px?: number;
 };
 
@@ -46,11 +45,9 @@ type Headline = {
   side?: "BUY"|"SELL"|"UNKNOWN";
   notional: number;
   ts: number;
-
   action?: ActionLabel;
   action_conf?: ActionConf;
   at?: "bid" | "ask" | "mid" | "between";
-
   ul_px?: number;
 };
 
@@ -59,17 +56,17 @@ type Watchlist = {
   options: { underlying: string; expiration: string; strike: number; right: "C"|"P" }[];
 };
 
-type Notable = {
-  tag: string;
-  text: string;
-  weight?: number;
-  ts?: number;
-  action?: ActionLabel;
-  action_conf?: ActionConf;
-  at?: "bid" | "ask" | "mid" | "between";
-  ul?: string;
-  ul_px?: number;
-};
+// type Notable = {
+//   tag: string;
+//   text: string;
+//   weight?: number;
+//   ts?: number;
+//   action?: ActionLabel;
+//   action_conf?: ActionConf;
+//   at?: "bid" | "ask" | "mid" | "between";
+//   ul?: string;
+//   ul_px?: number;
+// };
 
 /* ============== Helpers ============== */
 const nf0 = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
@@ -100,7 +97,6 @@ function toNum(n:any): number | undefined {
   const v = Number(n);
   return Number.isFinite(v) ? v : undefined;
 }
-
 function norm(sym?: string) {
   return (sym ?? "").toString().trim().toUpperCase();
 }
@@ -126,7 +122,6 @@ function standardizePrint(x: any): SweepBlockBase {
 
   const price = Number(x.price ?? x.px ?? x.last ?? x.bid ?? x.ask ?? 0);
   const qty   = Number(x.qty   ?? x.size ?? x.quantity ?? 0);
-
   const ul_px = toNum(x.ul_px);
 
   return {
@@ -202,7 +197,122 @@ function ActionBadge({ action, conf, at }: { action?: ActionLabel; conf?: Action
     </View>
   );
 }
+function standardizeNotable(x:any): Notable {
+  const ul = coerceUl(x);
+  const weight = toNum(x.score) ?? toNum(x.weight);
+  const notl = toNum(x.notional) ?? toNum(x.notional$) ?? toNum(x.notional_usd);
+  const qty  = toNum(x.qty) ?? toNum(x.qty$) ?? toNum(x.count) ?? toNum(x.size);
+  const burst = toNum(x.burst);
+  const dte   = toNum(x.dteAvg ?? x.dte);
 
+  // Prefer server-provided headline; otherwise compose a readable line
+  const text =
+    x.headline ||
+    [
+      ul,
+      String(x.side ?? "").toUpperCase(),
+      notl != null ? moneyCompact(notl) : undefined,
+      qty  != null ? `• ${nf0.format(qty)}x` : undefined,
+      burst!= null ? `• burst ${nf0.format(burst)}` : undefined,
+      dte  != null ? `• dte ${nf1.format(dte)}` : undefined,
+    ].filter(Boolean).join(" ");
+
+  return {
+    tag: String(x.kind ?? x.tag ?? "Notable").toUpperCase(),
+    text,
+    weight,
+    ts: toNum(x.ts) ?? Date.now(),
+    action: x.action,
+    action_conf: x.action_conf,
+    at: (x.at ?? x.aggressor)?.toLowerCase(),
+    ul,
+    ul_px: toNum(x.ul_px),
+  };
+}
+type Notable = {
+  tag?: string;            // e.g., "BLOCKS" or "SWEEPS"
+  kind?: "blocks" | "sweeps" | "prints";
+  text?: string;
+  headline?: string;
+
+  ul?: string;
+  ul_px?: number;
+
+  // scoring/summary coming from server
+  weight?: number;
+  score?: number;
+  dteAvg?: number;
+  qty$?: number;
+  notional$?: number;
+  burst?: number;
+
+  ts?: number;
+  action?: ActionLabel;
+  action_conf?: ActionConf;
+  at?: "bid" | "ask" | "mid" | "between";
+};
+function pickContractsForNotable(
+  n: Notable,
+  { blocks, sweeps, prints }: { blocks: SweepBlockBase[]; sweeps: SweepBlockBase[]; prints: SweepBlockBase[] },
+  now = Date.now()
+) {
+  const UL = norm(n.ul || "");
+  if (!UL) return [];
+
+  // time window: if notable has ts, use +/- 60s; else last 2m
+  const center = n.ts ?? now;
+  const windowMs = 60_000;
+  const since = center - windowMs;
+  const until = center + windowMs;
+
+  const inWin = (r: SweepBlockBase) => r.ts >= since && r.ts <= until && norm(r.ul) === UL;
+
+  // choose pool based on kind; fall back to all
+  let pool: SweepBlockBase[] = [];
+  if (n.kind === "blocks") pool = blocks.filter(inWin);
+  else if (n.kind === "sweeps") pool = sweeps.filter(inWin);
+  else if (n.kind === "prints") pool = prints.filter(inWin);
+  else pool = [...blocks, ...sweeps, ...prints].filter(inWin);
+
+  // group by (right,strike,expiry,at) and take the largest by notional
+  const key = (r: SweepBlockBase) => [r.right, r.strike, r.expiry, r.at ?? ""].join("|");
+  const agg = new Map<string, { sample: SweepBlockBase; qty: number; notional: number }>();
+  for (const r of pool) {
+    const k = key(r);
+    const cur = agg.get(k);
+    const notl = notionalOf(r);
+    if (!cur) agg.set(k, { sample: r, qty: r.qty || 0, notional: notl });
+    else {
+      cur.qty += r.qty || 0;
+      cur.notional += notl;
+    }
+  }
+
+  const rows = Array.from(agg.values())
+    .sort((a, b) => (b.notional - a.notional) || (b.qty - a.qty))
+    .slice(0, 3); // show top 3 legs max
+
+  return rows.map(x => x.sample);
+}
+function daysToExpiry(exp?: string) {
+  if (!exp) return undefined;
+  const d = new Date(exp + (exp.length === 10 ? "T20:00:00Z" : "")); // tolerate 'YYYY-MM-DD'
+  if (isNaN(+d)) return undefined;
+  return Math.max(0, Math.round((+d - Date.now()) / 86_400_000));
+}
+
+function ContractChip({ r }: { r: SweepBlockBase }) {
+  const dte = daysToExpiry(r.expiry);
+  return (
+    <View style={{flexDirection:"row", alignItems:"center", marginRight:8, paddingHorizontal:8, paddingVertical:4, borderWidth:1, borderColor:"#e5e7eb", borderRadius:8}}>
+      {chip(r.right === "CALL" ? "C" : "P", r.right === "CALL" ? "#16a34a" : "#dc2626")}
+      <Text style={{marginLeft:6}}>{r.strike}</Text>
+      {!!r.expiry && <Text style={{marginLeft:6, color:"#6b7280"}}>{r.expiry}</Text>}
+      {typeof dte === "number" && <Text style={{marginLeft:6, color:"#6b7280"}}>{dte} DTE</Text>}
+      {!!r.at && <Text style={{marginLeft:6, color:"#374151"}}>{String(r.at).toUpperCase()}</Text>}
+    </View>
+  );
+}
 /* ===== Vol/OI Ratio Chip ===== */
 function RatioChip({ vol, oi }: { vol?: number | null; oi?: number | null }) {
   const v = typeof vol === "number" && Number.isFinite(vol) ? vol : 0;
@@ -219,7 +329,7 @@ function RatioChip({ vol, oi }: { vol?: number | null; oi?: number | null }) {
 }
 
 /* ============== Tabs ============== */
-type Tab = "Headlines" | "Sweeps" | "Blocks" | "Notables" | "Watchlist";
+type Tab = "Headlines" | "Sweeps" | "Blocks" | "Prints" | "Notables" | "Watchlist";
 const TabButton = ({active, label, onPress}:{active:boolean;label:Tab;onPress:()=>void}) => (
   <TouchableOpacity onPress={onPress} style={{paddingVertical:8,paddingHorizontal:12,borderBottomWidth:3,borderBottomColor: active?"#1f2937":"transparent"}}>
     <Text style={{fontWeight: active?"700":"500"}}>{label}</Text>
@@ -232,10 +342,11 @@ export default function App() {
   const [headlines, setHeadlines] = useState<Headline[]>([]);
   const [sweeps, setSweeps] = useState<SweepBlockBase[]>([]);
   const [blocks, setBlocks] = useState<SweepBlockBase[]>([]);
+  const [prints, setPrints] = useState<SweepBlockBase[]>([]);
   const [notables, setNotables] = useState<Notable[]>([]);
   const [wl, setWl] = useState<Watchlist>({ equities:[], options:[] });
 
-  // Underlying prices cache (object keeps it simple for RN)
+  // Underlying prices cache
   const [ulPrices, setUlPrices] = useState<Record<string, number>>({});
   const setPrice = (sym:string, px:number|undefined|null) => {
     const s = norm(sym);
@@ -267,7 +378,6 @@ export default function App() {
         try {
           const msg = JSON.parse(e.data);
 
-          // Helper to set UL prices from various shapes
           const seedFromMap = (m:any) => {
             if (m && typeof m === "object") {
               for (const [k,v] of Object.entries(m)) setPrice(String(k), toNum(v as any));
@@ -275,16 +385,7 @@ export default function App() {
           };
 
           switch (msg.topic) {
-            case "equity_ts": {
-              const rows = Array.isArray(msg.data) ? msg.data : [];
-              for (const q of rows) {
-                const sym = coerceUl(q);
-                const last = toNum(q.last ?? q.price ?? q.close ?? q.bid ?? q.ask);
-                if (sym && last != null) setPrice(sym, last);
-              }
-              break;
-            }
-
+            case "equity_ts":
             case "quotes":
             case "ticks": {
               const rows = Array.isArray(msg.data) ? msg.data : [];
@@ -296,23 +397,24 @@ export default function App() {
               break;
             }
 
-            // NOTE: even if you don’t render prints as a list, we still consume ul_px
             case "prints": {
+              // ➕ NEW: actually render prints, not just seed UL price
               const arr = Array.isArray(msg.data) ? msg.data : [msg.data];
-              for (const m of arr) {
+              const inc: SweepBlockBase[] = arr.map(standardizePrint);
+              for (const m of inc) {
                 const ul = coerceUl(m);
                 const px = toNum(m.ul_px)
-                       ?? toNum(m.last) // some feeds include last
-                       ?? toNum(m.underlyingPrice);
+                        ?? toNum((m as any).last)
+                        ?? toNum((m as any).underlyingPrice);
                 if (ul && px != null) setPrice(ul, px);
               }
               if (msg.ul_prices) seedFromMap(msg.ul_prices);
+              setPrints(prev => mergeFlow(prev, inc, 1000));
               break;
             }
 
             case "sweeps": {
               const inc: SweepBlockBase[] = (msg.data ?? []).map(standardizePrint);
-              // opportunistically seed UL price from each row or a side map
               for (const r of inc) setPrice(r.ul, r.ul_px);
               if (msg.ul_prices) seedFromMap(msg.ul_prices);
               setSweeps(prev => mergeFlow(prev, inc));
@@ -329,7 +431,6 @@ export default function App() {
 
             case "headlines": {
               const list: Headline[] = (msg.data ?? []).map(standardizeHeadline);
-              // update UL price if headlines carry ul_px
               for (const h of list) if (h.ul && h.ul_px != null) setPrice(h.ul, h.ul_px);
 
               setHeadlines(prev => {
@@ -346,10 +447,17 @@ export default function App() {
             }
 
             case "notables": {
-              const list: Notable[] = Array.isArray(msg.data) ? msg.data : [];
+              const raw = Array.isArray(msg.data) ? msg.data : [];
+              const list: Notable[] = raw.map(standardizeNotable);
+
+              // seed UL prices if present
               for (const n of list) {
                 if (n.ul && n.ul_px != null) setPrice(n.ul, n.ul_px);
               }
+              if (msg.ul_prices && typeof msg.ul_prices === "object") {
+                for (const [k, v] of Object.entries(msg.ul_prices)) setPrice(String(k), toNum(v as any));
+              }
+
               setNotables(list);
               break;
             }
@@ -359,16 +467,14 @@ export default function App() {
               break;
             }
           }
-        } catch {
-          // swallow
-        }
+        } catch {}
       };
     };
     connect();
     return () => { stop = true; wsRef.current?.close(); };
   }, []);
 
-  // First-load fallback (optional) — backfill notables
+  // First-load fallback — backfill notables
   useEffect(() => {
     (async () => {
       try {
@@ -378,13 +484,14 @@ export default function App() {
     })();
   }, []);
 
-  // OPTIONAL: gentle polling to backfill UL prices if your API provides it
+  // OPTIONAL: gentle polling to backfill UL prices
   useEffect(() => {
     let id:any;
     const poll = async () => {
       try {
         const uls = Array.from(new Set([
-          ...sweeps.map(s=>s.ul), ...blocks.map(b=>b.ul), ...headlines.map(h=>h.ul),
+          ...sweeps.map(s=>s.ul), ...blocks.map(b=>b.ul),
+          ...prints.map(p=>p.ul), ...headlines.map(h=>h.ul),
           ...notables.map(n=>n.ul).filter(Boolean) as string[]
         ].filter(Boolean)));
         if (uls.length) {
@@ -406,7 +513,7 @@ export default function App() {
     };
     poll();
     return () => clearTimeout(id);
-  }, [sweeps, blocks, headlines, notables]);
+  }, [sweeps, blocks, prints, headlines, notables]);
 
   /* ===== Filters & sorting ===== */
   const metric = (r:SweepBlockBase, key: typeof sortKey) => {
@@ -431,6 +538,7 @@ export default function App() {
   };
   const sweepsV = useMemo(()=>filterSort(sweeps).slice(0,300), [sweeps, minNotional, minQty, sortKey, sortDir]);
   const blocksV = useMemo(()=>filterSort(blocks).slice(0,300), [blocks, minNotional, minQty, sortKey, sortDir]);
+  const printsV = useMemo(()=>filterSort(prints).slice(0,300), [prints, minNotional, minQty, sortKey, sortDir]);
 
   /* ===== REST helpers (watchlist) ===== */
   async function addEquity(sym:string){
@@ -447,7 +555,6 @@ export default function App() {
     const sideColorHex = r.side === "BUY" ? "#16a34a" : r.side === "SELL" ? "#dc2626" : "#6b7280";
     const aggr = (r.aggressor || "").replace(/_/g, " ").trim();
     const ulText = norm(r.ul || "—");
-    // precedence: row.ul_px -> cache
     const ulPx = toNum(r.ul_px) ?? ulPrices[ulText];
     const ulPxDisp = typeof ulPx === "number" && Number.isFinite(ulPx) ? nf2.format(ulPx) : "—";
     const volDisp = typeof r.volume === "number" && Number.isFinite(r.volume) ? nf0.format(r.volume) : "—";
@@ -458,7 +565,6 @@ export default function App() {
         <View style={{width:64}}>
           <Text style={{fontFamily: Platform.OS==="ios"?"Menlo":"monospace"}}>{ulText}</Text>
         </View>
-        {/* Underlying price */}
         <View style={{width:90, alignItems:"flex-end"}}>
           <Text>{ulPxDisp}</Text>
         </View>
@@ -488,7 +594,6 @@ export default function App() {
           <Text style={{fontWeight: notionalOf(r)>=250000 ? "700" : "500"}}>{moneyCompact(notionalOf(r))}</Text>
         </View>
 
-        {/* Vol / OI / VolOI */}
         <View style={{width:90, alignItems:"flex-end"}}><Text>{volDisp}</Text></View>
         <View style={{width:90, alignItems:"flex-end"}}><Text>{oiDisp}</Text></View>
         <View style={{width:100, alignItems:"flex-end"}}><RatioChip vol={r.volume} oi={r.oi} /></View>
@@ -512,6 +617,7 @@ export default function App() {
           {!!rShort && <Text style={{marginLeft:6}}>{rShort}{h.strike ?? ""}</Text>}
           {!!h.expiry && <Text style={{marginLeft:8, color:"#6b7280"}}>{h.expiry}</Text>}
           {h.side && h.side!=="UNKNOWN" && <View style={{marginLeft:8}}>{chip(h.side, sideColorHex as any)}</View>}
+          {/* Ensure action badge shows for PRINT/SWEEP/BLOCK alike */}
           {h.action && <View style={{marginLeft:8}}><ActionBadge action={h.action} conf={h.action_conf} at={h.at} /></View>}
           <Text style={{marginLeft:"auto"}}>{moneyCompact(h.notional)}</Text>
         </View>
@@ -521,21 +627,51 @@ export default function App() {
   };
 
   const NotableRow = ({ n }: { n: Notable }) => {
-    const ul = n.ul ? norm(n.ul) : undefined;
-    const ulPx = ul ? (toNum(n.ul_px) ?? ulPrices[ul]) : undefined;
-    return (
-      <View style={{padding:12, borderBottomWidth:1, borderBottomColor:"#e5e7eb"}}>
-        <View style={{flexDirection:"row", alignItems:"center", marginBottom:6}}>
-          {chip(n.tag || "Notable", "#6b7280")}
-          {typeof n.weight==="number" && <Text style={{marginLeft:8, color:"#6b7280"}}>score {nf1.format(n.weight||0)}</Text>}
-          {n.action && <View style={{marginLeft:8}}><ActionBadge action={n.action} conf={n.action_conf} at={n.at} /></View>}
-          {!!ul && <Text style={{marginLeft:8, fontFamily: Platform.OS==="ios"?"Menlo":"monospace"}}>{ul} {ulPx!=null?`· ${nf2.format(ulPx)}`:""}</Text>}
-          <Text style={{marginLeft:"auto", color:"#6b7280"}}>{n.ts ? tsAgo(n.ts) : ""}</Text>
-        </View>
-        <Text>{n.text}</Text>
+  const ul = n.ul ? norm(n.ul) : undefined;
+  const ulPx = ul ? (toNum(n.ul_px) ?? ulPrices[ul]) : undefined;
+  const legs = pickContractsForNotable(n, { blocks, sweeps, prints });
+
+  return (
+    <View style={{padding:12, borderBottomWidth:1, borderBottomColor:"#e5e7eb"}}>
+      <View style={{flexDirection:"row", alignItems:"center", marginBottom:6}}>
+        {chip((n.tag || n.kind || "Notable").toString().toUpperCase(), "#6b7280")}
+        {typeof n.score === "number" && <Text style={{marginLeft:8, color:"#6b7280"}}>score {nf1.format(n.score)}</Text>}
+        {typeof n.dteAvg === "number" && <Text style={{marginLeft:8, color:"#6b7280"}}>avg {nf1.format(n.dteAvg)} DTE</Text>}
+        {!!ul && <Text style={{marginLeft:8, fontFamily: Platform.OS==="ios"?"Menlo":"monospace"}}>{ul} {ulPx!=null?`· ${nf2.format(ulPx)}`:""}</Text>}
+        <Text style={{marginLeft:"auto", color:"#6b7280"}}>{n.ts ? tsAgo(n.ts) : ""}</Text>
       </View>
-    );
-  };
+
+      {/* Headline or text */}
+      {!!n.headline && <Text style={{marginBottom:6}}>{n.headline}</Text>}
+      {!n.headline && !!n.text && <Text style={{marginBottom:6}}>{n.text}</Text>}
+
+      {/* Representative legs (derived client-side) */}
+      {legs.length > 0 ? (
+        <View style={{flexDirection:"row", flexWrap:"wrap", marginTop:2}}>
+          {legs.map((r, i) => <ContractChip key={i} r={r} />)}
+        </View>
+      ) : (
+        <Text style={{color:"#9ca3af"}}>No matching legs found in recent window.</Text>
+      )}
+    </View>
+  );
+};
+  // const NotableRow = ({ n }: { n: Notable }) => {
+  //   const ul = n.ul ? norm(n.ul) : undefined;
+  //   const ulPx = ul ? (toNum(n.ul_px) ?? ulPrices[ul]) : undefined;
+  //   return (
+  //     <View style={{padding:12, borderBottomWidth:1, borderBottomColor:"#e5e7eb"}}>
+  //       <View style={{flexDirection:"row", alignItems:"center", marginBottom:6}}>
+  //         {chip((n.tag || "Notable").replace(/_/g," ").toUpperCase(), "#6b7280")}
+  //         {typeof n.weight==="number" && <Text style={{marginLeft:8, color:"#6b7280"}}>score {nf1.format(n.weight||0)}</Text>}
+  //         {n.action && <View style={{marginLeft:8}}><ActionBadge action={n.action} conf={n.action_conf} at={n.at} /></View>}
+  //         {!!ul && <Text style={{marginLeft:8, fontFamily: Platform.OS==="ios"?"Menlo":"monospace"}}>{ul} {ulPx!=null?`· ${nf2.format(ulPx)}`:""}</Text>}
+  //         <Text style={{marginLeft:"auto", color:"#6b7280"}}>{n.ts ? tsAgo(n.ts) : ""}</Text>
+  //       </View>
+  //       <Text>{n.text}</Text>
+  //     </View>
+  //   );
+  // };
 
   /* ===== UI ===== */
   return (
@@ -549,13 +685,13 @@ export default function App() {
 
       {/* Tabs */}
       <View style={{flexDirection:"row", paddingHorizontal:8}}>
-        {(["Headlines","Sweeps","Blocks","Notables","Watchlist"] as Tab[]).map(t =>
+        {(["Headlines","Sweeps","Blocks","Prints","Notables","Watchlist"] as Tab[]).map(t =>
           <TabButton key={t} label={t} active={tab===t} onPress={()=>setTab(t)} />
         )}
       </View>
 
-      {/* Filters (for Sweeps/Blocks) */}
-      {(tab==="Sweeps" || tab==="Blocks") && (
+      {/* Filters (for Sweeps/Blocks/Prints) */}
+      {(tab==="Sweeps" || tab==="Blocks" || tab==="Prints") && (
         <View style={{padding:10, borderBottomWidth:1, borderBottomColor:"#e5e7eb", flexDirection:"row", alignItems:"center"}}>
           <Text>Min $</Text>
           <TextInput
@@ -609,6 +745,15 @@ export default function App() {
       {tab==="Blocks" && (
         <FlatList
           data={blocksV}
+          keyExtractor={(r,i)=>`${r.ts}:${r.ul}:${i}`}
+          ListHeaderComponent={()=>(<HeaderRow />)}
+          renderItem={({item}) => <Row r={item} />}
+        />
+      )}
+
+      {tab==="Prints" && (
+        <FlatList
+          data={printsV}
           keyExtractor={(r,i)=>`${r.ts}:${r.ul}:${i}`}
           ListHeaderComponent={()=>(<HeaderRow />)}
           renderItem={({item}) => <Row r={item} />}
