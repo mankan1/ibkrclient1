@@ -30,10 +30,16 @@ type SweepBlockBase = {
   at?: "bid" | "ask" | "mid" | "between";
   oi?: number | null;
   priorVol?: number | null;
-  volume?: number | null;
+  volume?: number | null; // current-day option volume
   reason?: string;
 
   ul_px?: number;
+
+  // NEW: option-quote bits (optional) to enable Mark/Δ even without a quotes stream
+  occ?: string;
+  bid?: number;
+  ask?: number;
+  mid?: number;
 };
 
 type Headline = {
@@ -57,7 +63,7 @@ type Watchlist = {
 };
 
 type Notable = {
-  tag?: string;                    // Display chip (e.g. BLOCKS)
+  tag?: string;            // e.g., "BLOCKS" or "SWEEPS"
   kind?: "blocks" | "sweeps" | "prints";
   text?: string;
   headline?: string;
@@ -65,15 +71,13 @@ type Notable = {
   ul?: string;
   ul_px?: number;
 
-  // Summary metrics
+  // scoring/summary coming from server
   weight?: number;
   score?: number;
   dteAvg?: number;
   qty$?: number;
   notional$?: number;
   burst?: number;
-
-  side?: "BUY" | "SELL" | "UNKNOWN";
 
   ts?: number;
   action?: ActionLabel;
@@ -114,7 +118,7 @@ function norm(sym?: string) {
   return (sym ?? "").toString().trim().toUpperCase();
 }
 
-/* ---------- Normalizers ---------- */
+/* ---------- UL/print normalizers (robust) ---------- */
 function coerceUl(x:any): string {
   let ul =
     x.ul ?? x.underlying ?? x.ul_symbol ?? x.symbol ?? x.root ?? x.underlyingSymbol ?? "";
@@ -129,6 +133,15 @@ function coerceUl(x:any): string {
   return String(ul || "—").toUpperCase();
 }
 
+function occFromParts(ul: string, expiry?: string, right?: "CALL"|"PUT", strike?: number) {
+  if (!ul || !expiry || !right || !Number.isFinite(strike)) return undefined;
+  const root = (ul + "      ").slice(0, 6);
+  const yymmdd = String(expiry).replace(/-/g, "").slice(2, 8);
+  const cp = right === "CALL" ? "C" : "P";
+  const k = String(Math.round((strike ?? 0) * 1000)).padStart(8, "0");
+  return `${root}${yymmdd}${cp}${k}`; // OCC 21 format
+}
+
 function standardizePrint(x: any): SweepBlockBase {
   const rightRaw = String(x.right ?? x.r ?? "").toUpperCase();
   const sideRaw  = String(x.side  ?? x.action ?? "").toUpperCase();
@@ -137,11 +150,22 @@ function standardizePrint(x: any): SweepBlockBase {
   const qty   = Number(x.qty   ?? x.size ?? x.quantity ?? 0);
   const ul_px = toNum(x.ul_px);
 
+  const ul = coerceUl(x);
+  const right: "CALL"|"PUT" = (rightRaw==="C"||rightRaw==="CALL") ? "CALL" : "PUT";
+  const strike = Number(x.strike ?? x.k ?? 0);
+  const expiry = String(x.expiry ?? x.expiration ?? x.exp ?? "");
+
+  const occ = String(x.occ || "").trim() || occFromParts(ul, expiry, right, strike);
+
+  const bid = toNum(x.bid);
+  const ask = toNum(x.ask);
+  const mid = toNum(x.mid ?? ((Number.isFinite(bid) && Number.isFinite(ask)) ? ((bid!+ask!)/2) : undefined));
+
   return {
-    ul: coerceUl(x),
-    right: (rightRaw==="C"||rightRaw==="CALL") ? "CALL" : "PUT",
-    strike: Number(x.strike ?? x.k ?? 0),
-    expiry: String(x.expiry ?? x.expiration ?? x.exp ?? ""),
+    ul,
+    right,
+    strike,
+    expiry,
     side: sideRaw==="BUY"||sideRaw==="B" ? "BUY" : sideRaw==="SELL"||sideRaw==="S" ? "SELL" : "UNKNOWN",
     qty,
     price,
@@ -157,6 +181,10 @@ function standardizePrint(x: any): SweepBlockBase {
     volume: toNum(x.volume ?? x.vol ?? x.day_volume),
     reason: x.reason,
     ul_px,
+    occ,
+    bid,
+    ask,
+    mid,
   };
 }
 
@@ -169,7 +197,7 @@ function standardizeHeadline(h:any): Headline {
     right: (rightRaw==="C"||rightRaw==="CALL") ? "C" : (rightRaw==="P"||rightRaw==="PUT") ? "P" : undefined,
     strike: toNum(h.strike ?? h.k),
     expiry: String(h.expiry ?? h.expiration ?? h.exp ?? "") || undefined,
-    side: (h.side ?? h.action ?? "UNKNOWN").toUpperCase() as any,
+    side: (h.side ?? h.action ?? "UNKNOWN").toUpperCase(),
     notional: Number(h.notional ?? h.notl ?? 0),
     ts: Number(h.ts ?? h.time ?? Date.now()),
     action: h.action,
@@ -179,7 +207,7 @@ function standardizeHeadline(h:any): Headline {
   };
 }
 
-/* ===== ActionBadge ===== */
+/* ===== ActionBadge (RN) ===== */
 function ActionBadge({ action, conf, at }: { action?: ActionLabel; conf?: ActionConf; at?: "bid"|"ask"|"mid"|"between" }) {
   const label = action ?? "—";
   const colorMap: Record<ActionLabel, string> = {
@@ -214,19 +242,17 @@ function ActionBadge({ action, conf, at }: { action?: ActionLabel; conf?: Action
 /* ===== Notables helpers ===== */
 function standardizeNotable(x:any): Notable {
   const ul = coerceUl(x);
-  const score = toNum(x.score);
-  const notl  = toNum(x.notional) ?? toNum(x.notional$) ?? toNum(x.notional_usd);
-  const qty   = toNum(x.qty) ?? toNum(x.qty$) ?? toNum(x.count) ?? toNum(x.size);
+  const weight = toNum(x.score) ?? toNum(x.weight);
+  const notl = toNum(x.notional) ?? toNum(x.notional$) ?? toNum(x.notional_usd);
+  const qty  = toNum(x.qty) ?? toNum(x.qty$) ?? toNum(x.count) ?? toNum(x.size);
   const burst = toNum(x.burst);
   const dte   = toNum(x.dteAvg ?? x.dte);
-  const side  = String(x.side ?? "UNKNOWN").toUpperCase() as Notable["side"];
-  const kind  = (String(x.kind || "").toLowerCase() as Notable["kind"]) || undefined;
 
   const text =
     x.headline ||
     [
       ul,
-      side,
+      String(x.side ?? "").toUpperCase(),
       notl != null ? moneyCompact(notl) : undefined,
       qty  != null ? `• ${nf0.format(qty)}x` : undefined,
       burst!= null ? `• burst ${nf0.format(burst)}` : undefined,
@@ -234,22 +260,22 @@ function standardizeNotable(x:any): Notable {
     ].filter(Boolean).join(" ");
 
   return {
-    tag: String(x.tag ?? x.kind ?? "Notable").toUpperCase(),
-    kind,
+    tag: String(x.kind ?? x.tag ?? "Notable").toUpperCase(),
     text,
-    headline: x.headline,
-    score,
+    weight,
+    ts: toNum(x.ts) ?? Date.now(),
+    action: x.action,
+    action_conf: x.action_conf,
+    at: (x.at ?? x.aggressor)?.toLowerCase(),
+    ul,
+    ul_px: toNum(x.ul_px),
+    kind: x.kind,
+    score: weight,
     dteAvg: dte,
     qty$: qty,
     notional$: notl,
     burst,
-    side,
-    ts: toNum(x.ts) ?? Date.now(),
-    action: x.action,
-    action_conf: x.action_conf,
-    at: (x.at ?? x.aggressor)?.toLowerCase() as any,
-    ul,
-    ul_px: toNum(x.ul_px),
+    headline: x.headline,
   };
 }
 
@@ -281,10 +307,7 @@ function pickContractsForNotable(
     const cur = agg.get(k);
     const notl = notionalOf(r);
     if (!cur) agg.set(k, { sample: r, qty: r.qty || 0, notional: notl });
-    else {
-      cur.qty += r.qty || 0;
-      cur.notional += notl;
-    }
+    else { cur.qty += r.qty || 0; cur.notional += notl; }
   }
 
   const rows = Array.from(agg.values())
@@ -296,7 +319,7 @@ function pickContractsForNotable(
 
 function daysToExpiry(exp?: string) {
   if (!exp) return undefined;
-  const d = new Date(exp + (exp.length === 10 ? "T20:00:00Z" : "")); // tolerate 'YYYY-MM-DD'
+  const d = new Date(exp + (exp.length === 10 ? "T20:00:00Z" : ""));
   if (isNaN(+d)) return undefined;
   return Math.max(0, Math.round((+d - Date.now()) / 86_400_000));
 }
@@ -304,7 +327,7 @@ function daysToExpiry(exp?: string) {
 function ContractChip({ r }: { r: SweepBlockBase }) {
   const dte = daysToExpiry(r.expiry);
   return (
-    <View style={{flexDirection:"row", alignItems:"center", marginRight:8, marginBottom:6, paddingHorizontal:8, paddingVertical:4, borderWidth:1, borderColor:"#e5e7eb", borderRadius:8}}>
+    <View style={{flexDirection:"row", alignItems:"center", marginRight:8, paddingHorizontal:8, paddingVertical:4, borderWidth:1, borderColor:"#e5e7eb", borderRadius:8}}>
       {chip(r.right === "CALL" ? "C" : "P", r.right === "CALL" ? "#16a34a" : "#dc2626")}
       <Text style={{marginLeft:6}}>{r.strike}</Text>
       {!!r.expiry && <Text style={{marginLeft:6, color:"#6b7280"}}>{r.expiry}</Text>}
@@ -356,6 +379,9 @@ export default function App() {
     setUlPrices(prev => (prev[s] === px ? prev : { ...prev, [s]: px }));
   };
 
+  // NEW: option marks (mid) by OCC
+  const [optMarks, setOptMarks] = useState<Record<string, number>>({});
+
   const [minNotional, setMinNotional] = useState<number>(20000);
   const [minQty, setMinQty] = useState<number>(50);
   const [sortKey, setSortKey] = useState<"ts"|"notional"|"qty"|"price"|"vol"|"oi"|"voloi">("ts");
@@ -398,9 +424,41 @@ export default function App() {
               break;
             }
 
+            // NEW: stream of option quotes to compute Mark; expect items { occ, bid, ask, mid? }
+            case "option_quotes": {
+              const rows = Array.isArray(msg.data) ? msg.data : [msg.data];
+              setOptMarks(prev => {
+                const next = { ...prev };
+                for (const q of rows) {
+                  const occ = String(q.occ || "").trim();
+                  const bid = toNum(q.bid);
+                  const ask = toNum(q.ask);
+                  const mid = toNum(q.mid ?? ((Number.isFinite(bid) && Number.isFinite(ask)) ? ((bid!+ask!)/2) : undefined));
+                  if (occ && Number.isFinite(mid)) next[occ] = mid!;
+                }
+                return next;
+              });
+              break;
+            }
+
             case "prints": {
               const arr = Array.isArray(msg.data) ? msg.data : [msg.data];
               const inc: SweepBlockBase[] = arr.map(standardizePrint);
+
+              // use embedded bid/ask to seed optMarks opportunistically
+              setOptMarks(prev => {
+                const next = { ...prev };
+                for (const r of inc) {
+                  if (r.occ) {
+                    const m = Number.isFinite(r.mid) ? r.mid
+                        : (Number.isFinite(r.bid) && Number.isFinite(r.ask)) ? ((r.bid!+r.ask!)/2)
+                        : undefined;
+                    if (Number.isFinite(m)) next[r.occ] = m!;
+                  }
+                }
+                return next;
+              });
+
               for (const m of inc) {
                 const ul = coerceUl(m);
                 const px = toNum(m.ul_px)
@@ -415,6 +473,18 @@ export default function App() {
 
             case "sweeps": {
               const inc: SweepBlockBase[] = (msg.data ?? []).map(standardizePrint);
+              setOptMarks(prev => {
+                const next = { ...prev };
+                for (const r of inc) {
+                  if (r.occ) {
+                    const m = Number.isFinite(r.mid) ? r.mid
+                        : (Number.isFinite(r.bid) && Number.isFinite(r.ask)) ? ((r.bid!+r.ask!)/2)
+                        : undefined;
+                    if (Number.isFinite(m)) next[r.occ] = m!;
+                  }
+                }
+                return next;
+              });
               for (const r of inc) setPrice(r.ul, r.ul_px);
               if (msg.ul_prices) seedFromMap(msg.ul_prices);
               setSweeps(prev => mergeFlow(prev, inc));
@@ -423,6 +493,18 @@ export default function App() {
 
             case "blocks": {
               const inc: SweepBlockBase[] = (msg.data ?? []).map(standardizePrint);
+              setOptMarks(prev => {
+                const next = { ...prev };
+                for (const r of inc) {
+                  if (r.occ) {
+                    const m = Number.isFinite(r.mid) ? r.mid
+                        : (Number.isFinite(r.bid) && Number.isFinite(r.ask)) ? ((r.bid!+r.ask!)/2)
+                        : undefined;
+                    if (Number.isFinite(m)) next[r.occ] = m!;
+                  }
+                }
+                return next;
+              });
               for (const r of inc) setPrice(r.ul, r.ul_px);
               if (msg.ul_prices) seedFromMap(msg.ul_prices);
               setBlocks(prev => mergeFlow(prev, inc));
@@ -450,14 +532,12 @@ export default function App() {
               const raw = Array.isArray(msg.data) ? msg.data : [];
               const list: Notable[] = raw.map(standardizeNotable);
 
-              // seed UL prices if present
               for (const n of list) {
                 if (n.ul && n.ul_px != null) setPrice(n.ul, n.ul_px);
               }
               if (msg.ul_prices && typeof msg.ul_prices === "object") {
                 for (const [k, v] of Object.entries(msg.ul_prices)) setPrice(String(k), toNum(v as any));
               }
-
               setNotables(list);
               break;
             }
@@ -555,8 +635,23 @@ export default function App() {
     const sideColorHex = r.side === "BUY" ? "#16a34a" : r.side === "SELL" ? "#dc2626" : "#6b7280";
     const aggr = (r.aggressor || "").replace(/_/g, " ").trim();
     const ulText = norm(r.ul || "—");
-    const ulPx = toNum(r.ul_px) ?? ulPrices[ulText];
-    const ulPxDisp = typeof ulPx === "number" && Number.isFinite(ulPx) ? nf2.format(ulPx) : "—";
+
+    // UL prices: show now + @trade if present
+    const ulPxNow = ulPrices[ulText];
+    const ulPxTrade = toNum(r.ul_px);
+    const ulNowDisp = Number.isFinite(ulPxNow) ? nf2.format(ulPxNow as number) : "—";
+    const ulTradeDisp = Number.isFinite(ulPxTrade) ? nf2.format(ulPxTrade as number) : undefined;
+
+    // Option mark + delta
+    const occ = r.occ || occFromParts(r.ul, r.expiry, r.right, r.strike);
+    const mark = (() => {
+      if (occ && Number.isFinite(optMarks[occ])) return optMarks[occ];
+      if (Number.isFinite(r.mid)) return r.mid;
+      if (Number.isFinite(r.bid) && Number.isFinite(r.ask)) return (r.bid! + r.ask!) / 2;
+      return undefined;
+    })();
+    const delta = Number.isFinite(mark) ? (mark as number) - r.price : undefined;
+
     const volDisp = typeof r.volume === "number" && Number.isFinite(r.volume) ? nf0.format(r.volume) : "—";
     const oiDisp  = typeof r.oi     === "number" && Number.isFinite(r.oi)     ? nf0.format(r.oi)     : "—";
 
@@ -565,8 +660,10 @@ export default function App() {
         <View style={{width:64}}>
           <Text style={{fontFamily: Platform.OS==="ios"?"Menlo":"monospace"}}>{ulText}</Text>
         </View>
+
         <View style={{width:90, alignItems:"flex-end"}}>
-          <Text>{ulPxDisp}</Text>
+          <Text>{ulNowDisp}</Text>
+          {ulTradeDisp && <Text style={{fontSize:12, color:"#6b7280"}}>@trade {ulTradeDisp}</Text>}
         </View>
 
         <View style={{width:42, alignItems:"center"}}>{chip(r.right==="CALL"?"C":"P", r.right==="CALL"?"#16a34a":"#dc2626")}</View>
@@ -586,6 +683,16 @@ export default function App() {
               {chip(aggr, "#6b7280")}
             </View>
           )}
+        </View>
+
+        {/* NEW: Mark + Δ */}
+        <View style={{width:90, alignItems:"flex-end"}}>
+          <Text>{Number.isFinite(mark) ? nf2.format(mark as number) : "—"}</Text>
+        </View>
+        <View style={{width:90, alignItems:"flex-end"}}>
+          <Text style={{color: (delta ?? 0) > 0 ? "#16a34a" : (delta ?? 0) < 0 ? "#dc2626" : "#111827"}}>
+            {Number.isFinite(delta) ? nf2.format(delta as number) : "—"}
+          </Text>
         </View>
 
         <View style={{width:90, alignItems:"flex-end"}}><Text>{nf0.format(r.qty)}</Text></View>
@@ -630,27 +737,21 @@ export default function App() {
     const ulPx = ul ? (toNum(n.ul_px) ?? ulPrices[ul]) : undefined;
     const legs = pickContractsForNotable(n, { blocks, sweeps, prints });
 
-    const sideColor = n.side === "BUY" ? "#16a34a" : n.side === "SELL" ? "#dc2626" : "#6b7280";
-
     return (
       <View style={{padding:12, borderBottomWidth:1, borderBottomColor:"#e5e7eb"}}>
         <View style={{flexDirection:"row", alignItems:"center", marginBottom:6}}>
           {chip((n.tag || n.kind || "Notable").toString().toUpperCase(), "#6b7280")}
-          {n.side && n.side!=="UNKNOWN" && <View style={{marginLeft:8}}>{chip(n.side, sideColor as any)}</View>}
           {typeof n.score === "number" && <Text style={{marginLeft:8, color:"#6b7280"}}>score {nf1.format(n.score)}</Text>}
           {typeof n.dteAvg === "number" && <Text style={{marginLeft:8, color:"#6b7280"}}>avg {nf1.format(n.dteAvg)} DTE</Text>}
           {!!ul && <Text style={{marginLeft:8, fontFamily: Platform.OS==="ios"?"Menlo":"monospace"}}>{ul} {ulPx!=null?`· ${nf2.format(ulPx)}`:""}</Text>}
           <Text style={{marginLeft:"auto", color:"#6b7280"}}>{n.ts ? tsAgo(n.ts) : ""}</Text>
         </View>
 
-        {/* Headline or text */}
         {!!n.headline && <Text style={{marginBottom:6}}>{n.headline}</Text>}
         {!n.headline && !!n.text && <Text style={{marginBottom:6}}>{n.text}</Text>}
 
-        {/* Representative legs */}
-        <Text style={{marginTop:2, marginBottom:4, color:"#6b7280"}}>Rep legs</Text>
         {legs.length > 0 ? (
-          <View style={{flexDirection:"row", flexWrap:"wrap"}}>
+          <View style={{flexDirection:"row", flexWrap:"wrap", marginTop:2}}>
             {legs.map((r, i) => <ContractChip key={i} r={r} />)}
           </View>
         ) : (
@@ -672,14 +773,9 @@ export default function App() {
 
       {/* Tabs */}
       <View style={{flexDirection:"row", paddingHorizontal:8}}>
-        {(['Headlines','Sweeps','Blocks','Prints','Notables','Watchlist'] as const).map((t) => (
-          <TabButton
-            key={t}
-            label={t as Tab}
-            active={tab === (t as Tab)}
-            onPress={() => setTab(t as Tab)}
-          />
-        ))}
+        {(["Headlines","Sweeps","Blocks","Prints","Notables","Watchlist"] as Tab[]).map(t =>
+          <TabButton key={t} label={t} active={tab===t} onPress={()=>setTab(t)} />
+        )}
       </View>
 
       {/* Filters (for Sweeps/Blocks/Prints) */}
@@ -704,10 +800,18 @@ export default function App() {
           </TouchableOpacity>
 
           <View style={{marginLeft:"auto", flexDirection:"row", alignItems:"center"}}>
-            {(["ts","notional","qty","price","vol","oi","voloi"] as const).map(k => (
-              <TouchableOpacity key={k} onPress={()=> setSortKey(prev => prev===k ? (setSortDir(d=>d===-1?1:-1), k) : (setSortDir(-1), k))} style={{marginLeft:10}}>
-                <Text style={{fontWeight: sortKey===k ? "700":"500"}}>
-                  {k}{sortKey===k ? (sortDir===-1?" ▼":" ▲"):""}
+            {(["ts","notional","qty","price","mark","vol","oi","voloi"] as const).map(k => (
+              <TouchableOpacity
+                key={String(k)}
+                onPress={()=>{
+                  // "mark" isn't a real sort key in metric(); map it to price for now
+                  const mapped = (k as any) === "mark" ? "price" : (k as any);
+                  setSortKey(prev => prev===mapped ? (setSortDir(d=>d===-1?1:-1), mapped as any) : (setSortDir(-1), mapped as any));
+                }}
+                style={{marginLeft:10}}
+              >
+                <Text style={{fontWeight: (k==="mark"?"price":k)===sortKey ? "700":"500"}}>
+                  {String(k)}{(k==="mark"?"price":k)===sortKey ? (sortDir===-1?" ▼":" ▲"):""}
                 </Text>
               </TouchableOpacity>
             ))}
@@ -807,6 +911,8 @@ const HeaderRow = () => (
     <Text style={{width:96, fontWeight:"700"}}>Expiry</Text>
     <Text style={{width:110, fontWeight:"700"}}>Action</Text>
     <Text style={{width:160, fontWeight:"700"}}>Side @ Px</Text>
+    <Text style={{width:90, textAlign:"right", fontWeight:"700"}}>Mark</Text>
+    <Text style={{width:90, textAlign:"right", fontWeight:"700"}}>Δ</Text>
     <Text style={{width:90, textAlign:"right", fontWeight:"700"}}>Qty</Text>
     <Text style={{width:100, textAlign:"right", fontWeight:"700"}}>Notional</Text>
     <Text style={{width:90, textAlign:"right", fontWeight:"700"}}>Vol</Text>
