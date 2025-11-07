@@ -1,4 +1,10 @@
-// src/App.tsx
+// App.tsx — drop-in version with minimal futures-safe tweaks
+// - Normalizes ULs ("/ES" -> "ES", "$SPX" -> "SPX")
+// - Never fabricates OCC for futures (server must supply); keeps equity/index fallback
+// - Notional fallback uses per-instrument multipliers (ES:50, etc.; equities default 100)
+// - DTE parser tolerant of YYYY-MM, YYYYMM, YYMMDD, YYYYMMDD
+// - setPrice uses the same UL normalizer to avoid duplicate keys
+
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { FlatList, Platform, SafeAreaView, StatusBar, Text, TextInput, TouchableOpacity, View } from "react-native";
 import Constants from "expo-constants";
@@ -35,11 +41,14 @@ type SweepBlockBase = {
 
   ul_px?: number;
 
-  // NEW: option-quote bits (optional) to enable Mark/Δ even without a quotes stream
+  // option-quote bits (optional) to enable Mark/Δ even without a quotes stream
   occ?: string;
   bid?: number;
   ask?: number;
   mid?: number;
+
+  // NEW: optional contract multiplier (server may fill for futures/FOP)
+  mult?: number;
 };
 
 type Headline = {
@@ -90,7 +99,49 @@ const nf0 = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 const nf1 = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 });
 const nf2 = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const moneyCompact = (n:number)=> new Intl.NumberFormat("en-US",{style:"currency",currency:"USD",notation:"compact",maximumFractionDigits:1}).format(Math.max(0,Math.round(n||0)));
-const notionalOf = (m: Partial<SweepBlockBase>) => Math.round((m.notional ?? 0) || (m.qty! * m.price! * 100));
+
+function toNum(n:any): number | undefined { const v = Number(n); return Number.isFinite(v) ? v : undefined; }
+function norm(sym?: string) { return (sym ?? "").toString().trim().toUpperCase(); }
+
+// NEW: futures roots + multipliers (fallback only; server notional wins)
+const FUT_ROOTS = new Set(["ES","NQ","YM","RTY","CL","NG","GC","SI","ZN","ZB","ZF","ZT","6E","6B","6J"]);
+const FUT_MULT: Record<string, number> = {
+  ES: 50, NQ: 20, YM: 5, RTY: 50,
+  CL: 1000, NG: 10000, GC: 100, SI: 5000,
+  ZN: 1000, ZB: 1000, ZF: 1000, ZT: 2000,
+  "6E": 125000, "6B": 62500, "6J": 12500000, // currency future points are per unit; rough placeholders
+};
+function inferredMult(ul:string) { return FUT_MULT[ul] ?? 100; /* 100 = equity options */ }
+
+// UPDATED: stricter UL normalizer (removes leading '/', normalizes $SPX)
+function coerceUl(x:any): string {
+  let ul = x?.ul ?? x?.underlying ?? x?.ul_symbol ?? x?.symbol ?? x?.root ?? x?.underlyingSymbol ?? "";
+  if (!ul && typeof x?.occ === "string") { const m = x.occ.match(/^([A-Z]{1,6})\s/); if (m) ul = m[1]; }
+  if (!ul && typeof x?.ticker === "string") ul = x.ticker.split(/\s+/)[0] || "";
+  ul = String(ul || "—").toUpperCase().trim();
+  if (ul.startsWith("/")) ul = ul.slice(1);
+  if (ul === "$SPX") ul = "SPX";
+  return ul;
+}
+
+function occFromParts(ul: string, expiry?: string, right?: "CALL"|"PUT", strike?: number) {
+  if (!ul || !expiry || !right || !Number.isFinite(strike)) return undefined;
+  if (FUT_ROOTS.has(ul)) return undefined; // don't guess OCC for futures options
+  const root = (ul + "      ").slice(0, 6);
+  const yymmdd = String(expiry).replace(/-/g, "").slice(2, 8);
+  const cp = right === "CALL" ? "C" : "P";
+  const k = String(Math.round((strike ?? 0) * 1000)).padStart(8, "0");
+  return `${root}${yymmdd}${cp}${k}`; // OCC 21 format (equities/index only)
+}
+
+// UPDATED: notional fallback uses multiplier (server notional preferred)
+const notionalOf = (m: Partial<SweepBlockBase>) => {
+  if (Number.isFinite(m.notional as number)) return Math.round(m.notional as number);
+  const ul = m.ul ? coerceUl({ ul: m.ul }) : "";
+  const mult = m.mult ?? inferredMult(ul);
+  return Math.round((m.qty ?? 0) * (m.price ?? 0) * mult);
+};
+
 const tsAgo = (t:number) => {
   const d = Date.now() - t;
   if (d < 1500) return "now";
@@ -110,38 +161,7 @@ const chip = (txt: string, color: string = "#6b7280") => (
   </View>
 );
 
-function toNum(n:any): number | undefined {
-  const v = Number(n);
-  return Number.isFinite(v) ? v : undefined;
-}
-function norm(sym?: string) {
-  return (sym ?? "").toString().trim().toUpperCase();
-}
-
 /* ---------- UL/print normalizers (robust) ---------- */
-function coerceUl(x:any): string {
-  let ul =
-    x.ul ?? x.underlying ?? x.ul_symbol ?? x.symbol ?? x.root ?? x.underlyingSymbol ?? "";
-
-  if (!ul && typeof x.occ === "string") {
-    const m = x.occ.match(/^([A-Z]{1,6})\s/);
-    if (m) ul = m[1];
-  }
-  if (!ul && typeof x.ticker === "string") {
-    ul = x.ticker.split(/\s+/)[0] || "";
-  }
-  return String(ul || "—").toUpperCase();
-}
-
-function occFromParts(ul: string, expiry?: string, right?: "CALL"|"PUT", strike?: number) {
-  if (!ul || !expiry || !right || !Number.isFinite(strike)) return undefined;
-  const root = (ul + "      ").slice(0, 6);
-  const yymmdd = String(expiry).replace(/-/g, "").slice(2, 8);
-  const cp = right === "CALL" ? "C" : "P";
-  const k = String(Math.round((strike ?? 0) * 1000)).padStart(8, "0");
-  return `${root}${yymmdd}${cp}${k}`; // OCC 21 format
-}
-
 function standardizePrint(x: any): SweepBlockBase {
   const rightRaw = String(x.right ?? x.r ?? "").toUpperCase();
   const sideRaw  = String(x.side  ?? x.action ?? "").toUpperCase();
@@ -161,6 +181,8 @@ function standardizePrint(x: any): SweepBlockBase {
   const ask = toNum(x.ask);
   const mid = toNum(x.mid ?? ((Number.isFinite(bid) && Number.isFinite(ask)) ? ((bid!+ask!)/2) : undefined));
 
+  const mult = toNum(x.mult) ?? (FUT_ROOTS.has(ul) ? inferredMult(ul) : 100);
+
   return {
     ul,
     right,
@@ -169,7 +191,7 @@ function standardizePrint(x: any): SweepBlockBase {
     side: sideRaw==="BUY"||sideRaw==="B" ? "BUY" : sideRaw==="SELL"||sideRaw==="S" ? "SELL" : "UNKNOWN",
     qty,
     price,
-    notional: Number(x.notional ?? (qty && price ? qty*price*100 : 0)),
+    notional: Number(x.notional ?? (qty && price ? qty*price*mult! : 0)),
     prints: Number(x.prints ?? x.parts ?? 1),
     ts: Number(x.ts ?? x.time ?? Date.now()),
     aggressor: x.aggressor ?? x.liq ?? x.liq_ind ?? x.at,
@@ -185,6 +207,7 @@ function standardizePrint(x: any): SweepBlockBase {
     bid,
     ask,
     mid,
+    mult,
   };
 }
 
@@ -319,7 +342,17 @@ function pickContractsForNotable(
 
 function daysToExpiry(exp?: string) {
   if (!exp) return undefined;
-  const d = new Date(exp + (exp.length === 10 ? "T20:00:00Z" : ""));
+  let s = String(exp).replace(/\s+/g, "");
+  if (/^\d{6}$/.test(s)) { // yyyymm
+    s = `${s.slice(0,4)}-${s.slice(4,6)}-17`; // approx 3rd Fri
+  } else if (/^\d{8}$/.test(s)) { // yyyymmdd
+    s = `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}`;
+  } else if (/^\d{2}\d{4}$/.test(s)) { // yymmdd
+    s = `20${s.slice(0,2)}-${s.slice(2,4)}-${s.slice(4,6)}`;
+  } else if (/^\d{4}-\d{2}$/.test(s)) { // YYYY-MM
+    s = `${s}-17`;
+  }
+  const d = new Date(s.length === 10 ? s + "T20:00:00Z" : s);
   if (isNaN(+d)) return undefined;
   return Math.max(0, Math.round((+d - Date.now()) / 86_400_000));
 }
@@ -373,13 +406,13 @@ export default function App() {
   // Underlying prices cache
   const [ulPrices, setUlPrices] = useState<Record<string, number>>({});
   const setPrice = (sym:string, px:number|undefined|null) => {
-    const s = norm(sym);
+    const s = coerceUl({ ul: sym }); // UPDATED: use same UL normalizer everywhere
     if (!s) return;
     if (typeof px !== "number" || !Number.isFinite(px)) return;
     setUlPrices(prev => (prev[s] === px ? prev : { ...prev, [s]: px }));
   };
 
-  // NEW: option marks (mid) by OCC
+  // option marks (mid) by OCC
   const [optMarks, setOptMarks] = useState<Record<string, number>>({});
 
   const [minNotional, setMinNotional] = useState<number>(20000);
@@ -424,8 +457,7 @@ export default function App() {
               break;
             }
 
-            // NEW: stream of option quotes to compute Mark; expect items { occ, bid, ask, mid? }
-            case "option_quotes": {
+            case "option_quotes": { // stream of option quotes to compute Mark; expect items { occ, bid, ask, mid? }
               const rows = Array.isArray(msg.data) ? msg.data : [msg.data];
               setOptMarks(prev => {
                 const next = { ...prev };
@@ -445,7 +477,7 @@ export default function App() {
               const arr = Array.isArray(msg.data) ? msg.data : [msg.data];
               const inc: SweepBlockBase[] = arr.map(standardizePrint);
 
-              // use embedded bid/ask to seed optMarks opportunistically
+              // seed optMarks from embedded bid/ask
               setOptMarks(prev => {
                 const next = { ...prev };
                 for (const r of inc) {
@@ -634,7 +666,7 @@ export default function App() {
   const Row = ({ r }: { r: SweepBlockBase }) => {
     const sideColorHex = r.side === "BUY" ? "#16a34a" : r.side === "SELL" ? "#dc2626" : "#6b7280";
     const aggr = (r.aggressor || "").replace(/_/g, " ").trim();
-    const ulText = norm(r.ul || "—");
+    const ulText = coerceUl({ ul: r.ul });
 
     // UL prices: show now + @trade if present
     const ulPxNow = ulPrices[ulText];
@@ -685,7 +717,7 @@ export default function App() {
           )}
         </View>
 
-        {/* NEW: Mark + Δ */}
+        {/* Mark + Δ */}
         <View style={{width:90, alignItems:"flex-end"}}>
           <Text>{Number.isFinite(mark) ? nf2.format(mark as number) : "—"}</Text>
         </View>
@@ -733,7 +765,7 @@ export default function App() {
   };
 
   const NotableRow = ({ n }: { n: Notable }) => {
-    const ul = n.ul ? norm(n.ul) : undefined;
+    const ul = n.ul ? coerceUl({ ul: n.ul }) : undefined;
     const ulPx = ul ? (toNum(n.ul_px) ?? ulPrices[ul]) : undefined;
     const legs = pickContractsForNotable(n, { blocks, sweeps, prints });
 
@@ -804,7 +836,6 @@ export default function App() {
               <TouchableOpacity
                 key={String(k)}
                 onPress={()=>{
-                  // "mark" isn't a real sort key in metric(); map it to price for now
                   const mapped = (k as any) === "mark" ? "price" : (k as any);
                   setSortKey(prev => prev===mapped ? (setSortDir(d=>d===-1?1:-1), mapped as any) : (setSortDir(-1), mapped as any));
                 }}
@@ -824,7 +855,7 @@ export default function App() {
         <FlatList
           data={headlines}
           keyExtractor={(h,i)=>`${h.ts}:${i}`}
-          ListHeaderComponent={()=>(<View style={{padding:10}}><Text style={{fontWeight:"700"}}>Top Flow (rolling 60s)</Text></View>)}
+          ListHeaderComponent={()=> (<View style={{padding:10}}><Text style={{fontWeight:"700"}}>Top Flow (rolling 60s)</Text></View>)}
           renderItem={({item})=> <HeadlineRow h={item} />}
         />
       )}
@@ -833,7 +864,7 @@ export default function App() {
         <FlatList
           data={sweepsV}
           keyExtractor={(r,i)=>`${r.ts}:${r.ul}:${i}`}
-          ListHeaderComponent={()=>(<HeaderRow />)}
+          ListHeaderComponent={()=> (<HeaderRow />)}
           renderItem={({item}) => <Row r={item} />}
         />
       )}
@@ -842,7 +873,7 @@ export default function App() {
         <FlatList
           data={blocksV}
           keyExtractor={(r,i)=>`${r.ts}:${r.ul}:${i}`}
-          ListHeaderComponent={()=>(<HeaderRow />)}
+          ListHeaderComponent={()=> (<HeaderRow />)}
           renderItem={({item}) => <Row r={item} />}
         />
       )}
@@ -851,7 +882,7 @@ export default function App() {
         <FlatList
           data={printsV}
           keyExtractor={(r,i)=>`${r.ts}:${r.ul}:${i}`}
-          ListHeaderComponent={()=>(<HeaderRow />)}
+          ListHeaderComponent={()=> (<HeaderRow />)}
           renderItem={({item}) => <Row r={item} />}
         />
       )}
@@ -860,7 +891,7 @@ export default function App() {
         <FlatList
           data={notables}
           keyExtractor={(n,i)=>`${n.ts}:${i}`}
-          ListHeaderComponent={()=>(<View style={{padding:10}}><Text style={{fontWeight:"700"}}>Notable Flow</Text></View>)}
+          ListHeaderComponent={()=> (<View style={{padding:10}}><Text style={{fontWeight:"700"}}>Notable Flow</Text></View>)}
           renderItem={({item})=> <NotableRow n={item} />}
         />
       )}
@@ -885,8 +916,8 @@ export default function App() {
           <FlatList
             data={wl.equities}
             keyExtractor={(s)=>s}
-            ListHeaderComponent={()=>(<View style={{padding:10}}><Text style={{fontWeight:"700"}}>Equities</Text></View>)}
-            renderItem={({item:s})=>(
+            ListHeaderComponent={()=> (<View style={{padding:10}}><Text style={{fontWeight:"700"}}>Equities</Text></View>)}
+            renderItem={({item:s})=> (
               <View style={{padding:12, borderBottomWidth:1, borderBottomColor:"#e5e7eb", flexDirection:"row", alignItems:"center"}}>
                 <Text style={{fontFamily: Platform.OS==="ios"?"Menlo":"monospace"}}>{s}</Text>
                 <TouchableOpacity onPress={()=>delEquity(s)} style={{marginLeft:"auto"}}>
